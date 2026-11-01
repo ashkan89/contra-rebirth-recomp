@@ -21,9 +21,12 @@ void nand_init(const char* root) {
     {
                 char p[64]; snprintf(p, sizeof p, "title/%08x/%08x/data", (unsigned)(g_title.title_id >> 32), (unsigned)g_title.title_id);
         fs::create_directories(g_nand / p, ec);
+        if(ec) { fprintf(g_log,"[nand] cannot create save directory: %s\n",ec.message().c_str()); exit(1); }
     }
     fs::create_directories(g_nand / "shared2/sys", ec);
+    if(ec) { fprintf(g_log,"[nand] cannot create system directory: %s\n",ec.message().c_str()); exit(1); }
     fs::create_directories(g_nand / "tmp", ec);
+    if(ec) { fprintf(g_log,"[nand] cannot create temporary directory: %s\n",ec.message().c_str()); exit(1); }
     fprintf(g_log, "[nand] root %s\n", g_nand.string().c_str());
 }
 static fs::path host_path(const std::string& p) {
@@ -50,21 +53,24 @@ void nand_close(void* h) { delete (NandFile*)h; }
 int32_t nand_read(void* h, uint32_t dst, uint32_t len) {
     auto* f = (NandFile*)h;
     std::ifstream in(f->path, std::ios::binary);
+    if(!in) return FS_EACCESS;
     in.seekg(f->pos);
     std::vector<char> buf(len);
     in.read(buf.data(), len);
     uint32_t got = (uint32_t)in.gcount();
-    for (uint32_t i = 0; i < got; i++) W8(dst + i, (uint8_t)buf[i]);
+    if(got) memcpy(MEM + xl(dst),buf.data(),got);
     f->pos += got;
     return (int32_t)got;
 }
 int32_t nand_write(void* h, uint32_t src, uint32_t len) {
     auto* f = (NandFile*)h;
     std::vector<char> buf(len);
-    for (uint32_t i = 0; i < len; i++) buf[i] = (char)R8(src + i);
+    if(len) memcpy(buf.data(),MEM + xl(src),len);
     std::fstream io(f->path, std::ios::binary | std::ios::in | std::ios::out);
+    if(!io) return FS_EACCESS;
     io.seekp(f->pos);
     io.write(buf.data(), len);
+    if(!io) return FS_EACCESS;
     f->pos += len;
     return (int32_t)len;
 }
@@ -111,7 +117,7 @@ int32_t fs_ioctl(uint32_t cmd, uint32_t in, uint32_t inlen, uint32_t out, uint32
             fs::path p = host_path(path_at(in + 6));
             if (fs::exists(p)) return FS_EEXIST;
             fs::create_directories(p, ec);
-            return 0;
+            return ec ? FS_EACCESS:0;
         }
         case 0x05: return 0;   // SetAttr
         case 0x06: { // GetAttr(path) -> attr
@@ -141,8 +147,8 @@ int32_t fs_ioctl(uint32_t cmd, uint32_t in, uint32_t inlen, uint32_t out, uint32
             fs::path p = host_path(path_at(in + 6));
             if (fs::exists(p)) return FS_EEXIST;
             if (!fs::exists(p.parent_path())) return FS_ENOENT;
-            std::ofstream(p, std::ios::binary);
-            return 0;
+            std::ofstream file(p, std::ios::binary);
+            return file ? 0:FS_EACCESS;
         }
         case 0x0A: return 0;   // SetFileVerCtrl
         case 0x0D: return 0;   // Shutdown

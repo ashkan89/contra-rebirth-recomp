@@ -3,14 +3,8 @@
 // UI state is changed on the emulation thread (input); drawing happens on the
 // presentation thread after the game frame is blitted.
 #if defined(_WIN32) || defined(USE_SDL)
-#ifdef _WIN32
 #include "game.h"
-#include "glad.h"
-#else
-#define GL_GLEXT_PROTOTYPES
-#include <GL/gl.h>
-#include <GL/glext.h>
-#endif
+#include "gl_api.h"
 #include "overlay.h"
 #include "config.h"
 #include "font_atlas.h"
@@ -34,7 +28,7 @@ struct Item {
 };
 static const std::vector<Item>& items() {
     static std::vector<Item> v = {
-        {"Resolution", {"1x  640x528 (Wii)", "2x  1280x1056", "3x  1920x1584", "4x  2560x2112"}, nullptr},
+        {"Resolution", {"1x  640x528 (Wii)", "2x  1280x1056", "3x  1920x1584", "4x  2560x2112", "320x280", "480x320"}, "Changes internal rendering immediately; saved for next launch."},
         {"Aspect ratio", {"4:3", "16:9 widescreen"}, "The game's own layout switches after a restart."},
         {"VSync", {"Off", "On"}, nullptr},
         {"Fullscreen", {"Off", "On"}, nullptr},
@@ -52,7 +46,7 @@ static const std::vector<Item>& items() {
 }
 static int get_value(int i) {
     switch (i) {
-        case 0: return g_cfg.resolution_scale - 1;
+        case 0: return g_cfg.render_resolution ? g_cfg.render_resolution + 3 : std::clamp(g_cfg.resolution_scale - 1, 0, 3);
         case 1: return g_cfg.widescreen ? 1 : 0;
         case 2: return g_cfg.vsync ? 1 : 0;
         case 3: return g_cfg.fullscreen ? 1 : 0;
@@ -68,7 +62,10 @@ static int get_value(int i) {
 }
 static void set_value(int i, int v) {
     switch (i) {
-        case 0: g_cfg.resolution_scale = v + 1; break;
+        case 0:
+            g_cfg.render_resolution = v >= 4 ? v - 3 : 0;
+            if (v < 4) g_cfg.resolution_scale = v + 1;
+            break;
         case 1: g_cfg.widescreen = v; break;
         case 2: g_cfg.vsync = v; break;
         case 3: g_cfg.fullscreen = v; break;

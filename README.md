@@ -47,6 +47,14 @@ Changes:
 
 ## Building
 
+For the native ARM Linux port with hardware GLES2 rendering, see
+[RetroPie / Raspberry Pi notes](docs/RETROPIE.md). Stage 1 starts on the Zero 2 W,
+but full-speed play is not achieved. The default internal resolution is 640x528;
+320x280 and 480x320 are available in the settings menu.
+
+For the native 64-bit Raspberry Pi 5 build and installation, see
+[Pi 5 ARM64 notes](docs/PI5.md).
+
 The generated C++ is in `src/gen` (made with step 2 from the NTSC-U executable), so step 2 is only needed
 to regenerate it. GitHub Actions builds every push (see `.github/workflows/build-windows.yml`); version tags
 publish a release. Everything below is tested on Ubuntu 24.04; on Windows 10/11 use WSL (`wsl --install -d Ubuntu-24.04`

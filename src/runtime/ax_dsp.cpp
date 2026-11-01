@@ -94,7 +94,11 @@ static void process_voice(Voice& v) {
     int32_t vol = v.w[P_VOL];
     int16_t dvol = (int16_t)v.w[P_VOL + 1];
     int32_t smp[N];
-    for (int i = 0; i < N; i++) { smp[i] = (in[i] * vol) >> 15; vol += dvol; vol = std::max(0, std::min(0x7FFF, vol)); }
+    if(!dvol && vol<=0x7FFF) {
+        for(int i=0;i<N;i++) smp[i]=(in[i]*vol)>>15;
+    } else {
+        for (int i = 0; i < N; i++) { smp[i] = (in[i] * vol) >> 15; vol += dvol; vol = std::max(0, std::min(0x7FFF, vol)); }
+    }
     v.w[P_VOL] = (uint16_t)vol;
     // low-pass filter
     if (v.w[P_LPF]) {
@@ -108,7 +112,11 @@ static void process_voice(Voice& v) {
     auto mix = [&](int32_t* dst, int vi) {
         int32_t vv = v.w[P_MIX + vi];
         int16_t dv = ramp ? (int16_t)v.w[P_MIX + vi + 1] : 0;
-        for (int i = 0; i < N; i++) { dst[i] += (smp[i] * vv) >> 15; vv += dv; vv = std::max(0, std::min(0xFFFF, vv)); }
+        if(!dv) {
+            for(int i=0;i<N;i++) dst[i]+=(smp[i]*vv)>>15;
+        } else {
+            for (int i = 0; i < N; i++) { dst[i] += (smp[i] * vv) >> 15; vv += dv; vv = std::max(0, std::min(0xFFFF, vv)); }
+        }
         v.w[P_MIX + vi] = (uint16_t)vv;
     };
     if (ctrl & 1) mix(g_l, 0);
@@ -119,8 +127,12 @@ static void process_voice(Voice& v) {
 static void process_pbs(uint32_t pb) {
     for (int n = 0; pb && n < 256; n++) {
         uint32_t a = pb | 0x80000000u;
+        if(!R16(a+2*P_RUNNING)) { pb=R32(a); continue; }
         Voice v;
-        for (int i = 0; i < P_WORDS; i++) v.w[i] = R16(a + 2 * i);
+        const uint8_t* src=MEM+xl(a);
+        for (int i = 0; i < P_WORDS; i++) {
+            uint16_t word; memcpy(&word,src+2*i,2); v.w[i]=__builtin_bswap16(word);
+        }
         if (v.w[P_RUNNING]) {
             process_voice(v);
             // write back the state the DSP owns

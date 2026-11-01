@@ -31,9 +31,62 @@ static std::string swizzle(const uint32_t* bp, int table) {
 
 static const char* kAlphaCmp[8] = {"false", "(A < R)", "(A == R)", "(A <= R)", "(A > R)", "(A != R)", "(A >= R)", "true"};
 
+#ifdef USE_GLES2
+namespace {
+struct Interface { unsigned coords=0,textures=0,colors=0; bool packed=false; };
+Interface shader_interface(const uint32_t* bp) {
+    Interface used;
+    int stages=((bp[0]>>10)&15)+1;
+    for(int s=0;s<stages;s++) {
+        uint32_t order=bp[0x28+s/2]>>((s&1)*12);
+        if(order&64) { used.coords|=1u<<((order>>3)&7); used.textures|=1u<<(order&7); }
+        int channel=(order>>7)&7; if(channel<2) used.colors|=1u<<channel;
+    }
+    used.packed=__builtin_popcount(used.coords)+__builtin_popcount(used.colors)>8;
+    return used;
+}
+const char* tc_expr[8]={"a_tcpack0.xyz","vec3(a_tcpack0.w,a_tcpack1.xy)","vec3(a_tcpack1.zw,a_tcpack2.x)","a_tcpack2.yzw",
+    "a_tcpack3.xyz","vec3(a_tcpack3.w,a_tcpack4.xy)","vec3(a_tcpack4.zw,a_tcpack5.x)","a_tcpack5.yzw"};
+}
+std::string tev_vertex_shader_source(const uint32_t* bp) {
+    Interface used=shader_interface(bp);std::ostringstream o;
+    o<<"#version 330 core\nprecision highp float; in vec4 a_pos;\n";
+    if(used.colors) o<<"in vec4 a_colors;\n";
+    unsigned inputs=0;
+    for(int t=0;t<8;t++) if(used.coords&(1u<<t)) { inputs|=1u<<((3*t)/4); inputs|=1u<<((3*t+2)/4); }
+    if(used.packed) inputs=63;
+    for(int i=0;i<6;i++) if(inputs&(1u<<i)) o<<"in vec4 a_tcpack"<<i<<";\n";
+    if(used.packed) o<<"out mediump vec4 v_tcpack[6];\n";
+    else for(int t=0;t<8;t++) if(used.coords&(1u<<t)) o<<"out mediump vec3 v_tc"<<t<<";\n";
+    for(int c=0;c<2;c++) if(used.colors&(1u<<c)) o<<"out mediump vec4 v_c"<<c<<";\n";
+    o<<"void main(){gl_Position=a_pos;gl_Position.z=clamp(a_pos.z,-a_pos.w,a_pos.w);\n";
+    if(used.colors&1) o<<"v_c0=mod(a_colors,256.0)/255.0;\n";
+    if(used.colors&2) o<<"v_c1=floor(a_colors/256.0)/255.0;\n";
+    if(used.packed) for(int i=0;i<6;i++) o<<"v_tcpack["<<i<<"]=a_tcpack"<<i<<";\n";
+    else for(int t=0;t<8;t++) if(used.coords&(1u<<t)) o<<"v_tc"<<t<<"="<<tc_expr[t]<<";\n";
+    o<<"}\n";return o.str();
+}
+#endif
+
 std::string tev_shader_source(const uint32_t* bp) {
     int nstages = ((bp[0x00] >> 10) & 15) + 1;
     std::ostringstream o;
+#ifdef USE_GLES2
+    Interface used=shader_interface(bp);
+    o<<"#version 330 core\n";
+    for(int c=0;c<2;c++) if(used.colors&(1u<<c)) o<<"in mediump vec4 v_c"<<c<<";\n";
+    if(used.packed) o<<"in mediump vec4 v_tcpack[6];\n";
+    else for(int t=0;t<8;t++) if(used.coords&(1u<<t)) o<<"in mediump vec3 v_tc"<<t<<";\n";
+    for(int t=0;t<8;t++) if(used.textures&(1u<<t)) o<<"uniform sampler2D u_tex"<<t<<";\n";
+    o<<"out vec4 o_color; uniform vec4 u_reg[4]; uniform vec4 u_konst[4]; uniform vec2 u_aref;\n"
+       "vec3 q8(vec3 v){return floor(v*255.0+0.5);} float q8(float v){return floor(v*255.0+0.5);}\nvoid main(){\n";
+    if(used.packed) o<<"vec3 v_tc[8];\n"
+         "v_tc[0]=v_tcpack[0].xyz; v_tc[1]=vec3(v_tcpack[0].w,v_tcpack[1].xy);\n"
+         "v_tc[2]=vec3(v_tcpack[1].zw,v_tcpack[2].x); v_tc[3]=v_tcpack[2].yzw;\n"
+         "v_tc[4]=v_tcpack[3].xyz; v_tc[5]=vec3(v_tcpack[3].w,v_tcpack[4].xy);\n"
+         "v_tc[6]=vec3(v_tcpack[4].zw,v_tcpack[5].x); v_tc[7]=v_tcpack[5].yzw;\n";
+    o<<"vec4 prev=u_reg[0],c0=u_reg[1],c1=u_reg[2],c2=u_reg[3]; vec4 tex=vec4(1.0),ras=vec4(0.0); vec3 kc; float ka;\n";
+#else
     o << "#version 330 core\n"
          "in vec4 v_c0; in vec4 v_c1; in vec3 v_tc[8];\n"
          "out vec4 o_color;\n"
@@ -46,6 +99,7 @@ std::string tev_shader_source(const uint32_t* bp) {
          "void main(){\n"
          "  vec4 prev=u_reg[0], c0=u_reg[1], c1=u_reg[2], c2=u_reg[3];\n"
          "  vec4 tex=vec4(1.0), ras=vec4(0.0); vec3 kc; float ka;\n";
+#endif
     for (int s = 0; s < nstages; s++) {
         uint32_t order = bp[0x28 + s / 2] >> ((s & 1) * 12);
         int texmap = order & 7, texcoord = (order >> 3) & 7, enable = (order >> 6) & 1, chan = (order >> 7) & 7;
@@ -54,9 +108,14 @@ std::string tev_shader_source(const uint32_t* bp) {
         int kcs = ksel & 31, kas = (ksel >> 5) & 31;
         int rswap = aenv & 3, tswap = (aenv >> 2) & 3;
         o << "  // stage " << s << "\n";
-        if (enable)
+        if (enable) {
+#ifdef USE_GLES2
+            std::string tc=used.packed?"v_tc["+std::to_string(texcoord)+"]":"v_tc"+std::to_string(texcoord);
+            o<<"tex=texture(u_tex"<<texmap<<", "<<tc<<".xy/("<<tc<<".z==0.0?1.0:"<<tc<<".z))"<<swizzle(bp,tswap)<<";\n";
+#else
             o << "  tex = texture(u_tex[" << texmap << "], v_tc[" << texcoord << "].xy / (v_tc[" << texcoord << "].z == 0.0 ? 1.0 : v_tc[" << texcoord << "].z))" << swizzle(bp, tswap) << ";\n";
-        else
+#endif
+        } else
             o << "  tex = vec4(1.0);\n";
         if (chan == 0) o << "  ras = v_c0" << swizzle(bp, rswap) << ";\n";
         else if (chan == 1) o << "  ras = v_c1" << swizzle(bp, rswap) << ";\n";

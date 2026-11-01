@@ -4,6 +4,7 @@
 #include "hle.h"
 #include "gx_state.h"
 #include "gx_render.h"
+#include "host_threads.h"
 void gx_cp_written();
 #include <vector>
 #include <atomic>
@@ -165,11 +166,22 @@ static void parse_pending() {
     if (g_rd > 65536) { g_fifo.erase(g_fifo.begin(), g_fifo.begin() + g_rd); g_rd = 0; }
 }
 
+#ifdef PI_ZERO2
+static const size_t kRing = 4u << 20;
+static const size_t kMaxAhead = 1u << 20;
+#else
 static const size_t kRing = 32u << 20;                      // 32 MiB of commands in flight at most
 static const size_t kMaxAhead = 12u << 20;                   // the CPU waits when the GPU is this far behind
+#endif
 static uint8_t* g_ring = nullptr;
-static std::atomic<uint64_t> g_wpos{0}, g_rpos{0};
-static uint64_t g_wlocal = 0;
+#ifdef PI_ZERO2
+using RingCursor=uint32_t;  // unsigned differences remain valid across wrap
+#else
+using RingCursor=uint64_t;
+#endif
+alignas(64) static std::atomic<RingCursor> g_wpos{0};
+alignas(64) static std::atomic<RingCursor> g_rpos{0};
+alignas(64) static RingCursor g_wlocal = 0;
 static std::atomic<bool> g_gx_sleeping{false};
 static std::mutex g_gx_mx;
 static std::condition_variable g_gx_cv;
@@ -177,12 +189,20 @@ static int g_threaded = -1;
 std::atomic<uint64_t> g_gx_busy_ns{0};
 
 static void gx_thread() {
+    host_thread_role(2,"cr-gx");
     for (;;) {
-        uint64_t r = g_rpos.load(std::memory_order_relaxed), w = g_wpos.load(std::memory_order_acquire);
+        RingCursor r = g_rpos.load(std::memory_order_relaxed), w = g_wpos.load(std::memory_order_acquire);
         if (r == w) {
             // spin briefly (the next burst usually follows within microseconds), then sleep
             int spins = 0;
-            while (r == (w = g_wpos.load(std::memory_order_acquire)) && spins < 2000) { spins++; std::this_thread::yield(); }
+            while (r == (w = g_wpos.load(std::memory_order_acquire)) && spins < 128) {
+                spins++;
+#if defined(PI_ZERO2) && defined(__arm__)
+                __asm__ __volatile__("yield"); // CPU hint, not an OS scheduling syscall
+#else
+                std::this_thread::yield();
+#endif
+            }
             if (r == w) {
                 gx_flush_idle();
                 std::unique_lock<std::mutex> lk(g_gx_mx);
@@ -192,7 +212,7 @@ static void gx_thread() {
                 continue;
             }
         }
-        size_t n = (size_t)std::min<uint64_t>(w - r, 1u << 20);
+        size_t n = (size_t)std::min<RingCursor>((RingCursor)(w - r), 1u << 20);
         size_t off = (size_t)(r % kRing), first = std::min(n, kRing - off);
         g_fifo.insert(g_fifo.end(), g_ring + off, g_ring + off + first);
         if (first < n) g_fifo.insert(g_fifo.end(), g_ring, g_ring + (n - first));
@@ -219,7 +239,7 @@ void fifo_write(uint32_t v, int size) {
     if (g_wlocal - g_rpos.load(std::memory_order_acquire) > kMaxAhead) {
         while (g_wlocal - g_rpos.load(std::memory_order_acquire) > kMaxAhead / 2) {
             if (g_gx_sleeping.load()) g_gx_cv.notify_one();
-            std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }
     uint8_t b[4]; int k = 0;
@@ -229,5 +249,7 @@ void fifo_write(uint32_t v, int size) {
     for (int i = 0; i < k; i++) g_ring[(g_wlocal + i) % kRing] = b[i];
     g_wlocal += k;
     g_wpos.store(g_wlocal, std::memory_order_release);
-    if (g_gx_sleeping.load(std::memory_order_relaxed)) { std::lock_guard<std::mutex> lk(g_gx_mx); g_gx_cv.notify_one(); }
+    if (g_gx_sleeping.load(std::memory_order_relaxed) && g_gx_sleeping.exchange(false,std::memory_order_acq_rel)) {
+        std::lock_guard<std::mutex> lk(g_gx_mx); g_gx_cv.notify_one();
+    }
 }

@@ -18,10 +18,32 @@ struct Ctx {
     uint32_t spr[1024];
 };
 
-// 4 GiB reservation at a fixed host address; guest address == offset. A constant base
-// lets the compiler fold it into addressing instead of reloading a global after every store.
+// 64-bit hosts reserve 4 GiB at a fixed base. On 32-bit Linux, translate the
+// three backed guest regions into separate allocations (88 MiB + 64 KiB).
+#if UINTPTR_MAX == UINT32_MAX
+extern uint8_t* g_mem1;
+extern uint8_t* g_mem2;
+extern uint8_t* g_locked_cache;
+[[noreturn]] void guest_memory_fault(uint32_t address);
+struct GuestMemory {
+    uint8_t* operator+(uint32_t a) const {
+        if (a - 0x80000000u < 0x01800000u) return g_mem1 + (a - 0x80000000u);
+        if (a - 0x90000000u < 0x04000000u) return g_mem2 + (a - 0x90000000u);
+        if (a - 0xE0000000u < 0x00010000u) return g_locked_cache + (a - 0xE0000000u);
+        guest_memory_fault(a);
+    }
+    uint8_t& operator[](uint32_t a) const { return *(*this + a); }
+};
+#define MEM GuestMemory{}
+#else
+#if defined(__aarch64__)
+// Older Pi ARM64 kernels have a 39-bit user address space: 1 TiB is too high.
+#define GUEST_BASE 0x100000000ull
+#else
 #define GUEST_BASE 0x10000000000ull
+#endif
 #define MEM ((uint8_t*)GUEST_BASE)
+#endif
 
 // ---------------- memory ----------------
 uint32_t mmio_read(uint32_t a, int size);

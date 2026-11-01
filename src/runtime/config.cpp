@@ -12,6 +12,7 @@ static std::string g_ini_path = GAME_INI;
 static void set(const std::string& k, const std::string& v) {
     auto b = [&] { return v == "1" || v == "true" || v == "yes" || v == "on"; };
     if (k == "resolution_scale") g_cfg.resolution_scale = std::max(1, std::min(8, atoi(v.c_str())));
+    else if (k == "render_resolution") g_cfg.render_resolution = std::clamp(atoi(v.c_str()), 0, 2);
     else if (k == "vsync") g_cfg.vsync = b();
     else if (k == "widescreen") g_cfg.widescreen = b();
     else if (k == "fullscreen") g_cfg.fullscreen = b();
@@ -51,14 +52,14 @@ void config_load(const char* exe_path) {
         }
         fclose(f);
     }
-    const char* keys[] = {"resolution_scale", "vsync", "widescreen", "fullscreen", "window_scale", "controls", "show_perf",
+    const char* keys[] = {"resolution_scale", "render_resolution", "vsync", "widescreen", "fullscreen", "window_scale", "controls", "show_perf",
                           "anisotropy", "smooth_textures", "msaa", "speed", "swap_ab_xy"};
     for (const char* k : keys) {
         std::string env = k;
         std::transform(env.begin(), env.end(), env.begin(), ::toupper);
         if (const char* v = getenv(env.c_str())) set(k, v);
     }
-    fprintf(stderr, "[config] resolution x%d, %s, vsync %d, controls %s\n", g_cfg.resolution_scale,
+    fprintf(stderr, "[config] resolution %dx%d, %s, vsync %d, controls %s\n", g_cfg.render_width(), g_cfg.render_height(),
             g_cfg.widescreen ? "16:9" : "4:3", g_cfg.vsync, g_cfg.controls.c_str());
     if (write_defaults) config_save();
 }
@@ -70,6 +71,8 @@ void config_save() {
         "; " GAME_NAME " native port settings (also editable in-game: F1 or Esc, or Start+Back on a controller)\n\n"
         "; Internal rendering resolution: 1 = original 640x528, 2 = 1280x1056, 3 = 1920x1584, 4 = 2560x2112\n"
         "resolution_scale = %d\n"
+        "; Exact render size: 0 = Wii scale above, 1 = 320x280, 2 = 480x320\n"
+        "render_resolution = %d\n"
         "; Present 16:9 (the game is told the TV is widescreen). 0 = original 4:3\n"
         "widescreen = %d\n"
         "; Wait for the monitor refresh when presenting (smoother cut-scenes)\n"
@@ -92,7 +95,7 @@ void config_save() {
         "; Game speed: 1 = normal ... 8 = eight times (as far as the PC keeps up).\n"
         "; The game logic is tied to its frame rate, so this is fast-forward. Hold Tab (or click the right stick) for 4x (or double the set speed, up to 8x).\n"
         "speed = %d\n",
-        g_cfg.resolution_scale, g_cfg.widescreen, g_cfg.vsync, g_cfg.fullscreen, g_cfg.window_scale,
+        g_cfg.resolution_scale, g_cfg.render_resolution, g_cfg.widescreen, g_cfg.vsync, g_cfg.fullscreen, g_cfg.window_scale,
         g_cfg.controls.c_str(), g_cfg.swap_ab_xy, g_cfg.show_perf, g_cfg.anisotropy, g_cfg.smooth_textures, g_cfg.msaa, g_cfg.speed);
     fclose(w);
 }

@@ -10,6 +10,7 @@
 // unwinds SelectThread exactly like the real "OSSaveContext returned 1" path.
 #include "hle.h"
 #include "game.h"
+#include "host_threads.h"
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -37,6 +38,7 @@ static thread_local uint32_t t_irq_ctx = 0;              // context interrupted 
 static std::vector<std::unique_ptr<HThread>> g_threads;
 
 void threads_init_main(Ctx* c) {
+    host_thread_role(1,"cr-cpu");
     static HThread main_ht;
     static std::unique_lock<std::mutex> lk(g_big);
     t_self = &main_ht;
@@ -87,6 +89,7 @@ static void switch_to(HThread* next) {
 }
 
 static void thread_main(HThread* ht, uint32_t entry) {
+    host_thread_role(1,"cr-cpu");
     std::unique_lock<std::mutex> lk(g_big);
     t_self = ht;
     t_lock = &lk;

@@ -6,6 +6,7 @@
 #include "hle.h"
 #include "game.h"
 #include "gx_state.h"
+#include "gx_render.h"
 #include "config.h"
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +31,25 @@ FILE* g_log = stderr;
 static std::chrono::steady_clock::time_point T0;
 
 // ---------------------------------------------------------------- memory
+#if UINTPTR_MAX == UINT32_MAX
+uint8_t* g_mem1 = nullptr;
+uint8_t* g_mem2 = nullptr;
+uint8_t* g_locked_cache = nullptr;
+[[noreturn]] void guest_memory_fault(uint32_t address) {
+    fprintf(stderr, "[memory] unmapped guest address %08X\n", address);
+    abort();
+}
+static uint8_t* allocate_guest_region(size_t size) {
+    void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) { perror("guest mmap"); exit(1); }
+    return static_cast<uint8_t*>(p);
+}
+static void reserve_guest() {
+    g_mem1 = allocate_guest_region(0x01800000u);
+    g_mem2 = allocate_guest_region(0x04000000u);
+    g_locked_cache = allocate_guest_region(0x00010000u);
+}
+#else
 static void map_rw(uint32_t addr, uint32_t size) {
 #ifdef _WIN32
     if (!VirtualAlloc(MEM + addr, size, MEM_COMMIT, PAGE_READWRITE)) { fprintf(stderr, "commit failed %08X\n", addr); exit(1); }
@@ -52,6 +72,7 @@ static void reserve_guest() {
     map_rw(0x90000000u, 0x04000000u);   // MEM2 64 MiB
     map_rw(0xE0000000u, 0x00010000u);   // locked L1 cache
 }
+#endif
 
 static std::vector<uint8_t> readfile(const char* p) {
     FILE* f = fopen(p, "rb");
@@ -325,7 +346,17 @@ static uint64_t g_prof_buf[1 << 20];
 static std::atomic<uint32_t> g_prof_n{0};
 static void on_prof(int, siginfo_t*, void* uc) {
     uint32_t i = g_prof_n.fetch_add(1);
-    if (i < (1u << 20)) g_prof_buf[i] = (uint64_t)((ucontext_t*)uc)->uc_mcontext.gregs[REG_RIP];
+    if (i >= (1u << 20)) return;
+    const auto* ctx = static_cast<const ucontext_t*>(uc);
+#if defined(__aarch64__)
+    g_prof_buf[i] = ctx->uc_mcontext.pc;
+#elif defined(__arm__)
+    g_prof_buf[i] = ctx->uc_mcontext.arm_pc;
+#elif defined(__x86_64__)
+    g_prof_buf[i] = ctx->uc_mcontext.gregs[REG_RIP];
+#else
+#error "Implement the profiler program counter for this host architecture"
+#endif
 }
 static void prof_dump() {
     const char* f = getenv("PROFILE");
@@ -346,10 +377,12 @@ static void prof_start() {
     atexit(prof_dump);
 }
 static void on_segv(int sig, siginfo_t* si, void*) {
+#if UINTPTR_MAX > UINT32_MAX
     uintptr_t fa = (uintptr_t)si->si_addr;
     if (fa >= (uintptr_t)MEM && fa < (uintptr_t)MEM + 0x100000000ull)
         fprintf(LOG, "\n*** guest fault at %08X\n", (uint32_t)(fa - (uintptr_t)MEM));
     else
+#endif
         fprintf(LOG, "\n*** host fault at %p\n", si->si_addr);
     dump_ring();
     void* bt[32]; int n = backtrace(bt, 32); backtrace_symbols_fd(bt, n, 2);
@@ -396,6 +429,43 @@ int main(int argc, char** argv) {
     // main.dol, tmd.bin, ticket.bin and content/<index>.app (see tools/prepare_wad.py)
     std::string exe = exe_path(argv[0]);
     std::string exedir = exe.substr(0, exe.find_last_of("/\\") + 1);
+    if (argc == 2 && strcmp(argv[1], "--check-memory") == 0) {
+        reserve_guest();
+        // Exercise region edges, endian helpers, unaligned data and uncached mirrors.
+        const uint32_t addresses[] = {0x80000000u, 0x817FFFF8u, 0x90000000u, 0x93FFFFF8u, 0xE0000000u, 0xE000FFF8u};
+        for (uint32_t a : addresses) {
+            W64(a, 0x0123456789ABCDEFull);
+            if (R64(a) != 0x0123456789ABCDEFull || R32(a) != 0x01234567u || R16(a + 4) != 0x89ABu || R8(a + 7) != 0xEFu) return 2;
+            W32(a + 1, 0xA1B2C3D4u);
+            if (R32(a + 1) != 0xA1B2C3D4u) return 2;
+        }
+        for (unsigned i = 0; i < 6; ++i) W32(addresses[i], 0x7A000000u | i);
+        for (unsigned i = 0; i < 6; ++i) if (R32(addresses[i]) != (0x7A000000u | i)) return 2;
+        W32(0xC0000000u, 0x13579BDFu);
+        W32(0xD0000000u, 0x2468ACE0u);
+        if (R32(0x80000000u) != 0x13579BDFu || R32(0x90000000u) != 0x2468ACE0u) return 2;
+        fprintf(stderr, "Guest memory checks passed (%zu-bit host).\n", sizeof(void*) * 8);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--check-graphics") == 0) {
+#ifdef USE_GLES2
+        const char* api="OpenGL ES 2.0";
+#else
+        const char* api="OpenGL 3.3";
+#endif
+        config_load(exe.c_str());
+        if (!gl_platform_init(640, 528)) {
+            fprintf(stderr, "%s context check failed.\n",api);
+            return 2;
+        }
+        fprintf(stderr, "%s context check passed.\n",api);
+#ifndef _WIN32
+        // The SDL presenter is detached and may be waiting on a static CV.
+        fflush(nullptr);
+        std::_Exit(0);
+#endif
+        return 0;
+    }
     std::string rootstr;
     if (argc > 1) rootstr = argv[1];
     else {
@@ -450,7 +520,13 @@ int main(int argc, char** argv) {
     signal(SIGABRT, on_signal);
 #ifndef _WIN32
     signal(SIGALRM, on_signal);
-    alarm(getenv("TIMEOUT") ? atoi(getenv("TIMEOUT")) : 15);
+    if (const char* timeout = getenv("TIMEOUT")) {
+        int seconds = atoi(timeout);
+        if (seconds > 0) alarm(seconds);
+    }
+#ifndef USE_SDL
+    else alarm(15);  // automated headless runs only
+#endif
 #endif
 #ifndef _WIN32
     struct sigaction sa = {}; sa.sa_sigaction = on_segv; sa.sa_flags = SA_SIGINFO;

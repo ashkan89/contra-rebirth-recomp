@@ -1,14 +1,9 @@
 // Windowed platform layer (Windows, or Linux with -DUSE_SDL): SDL2 window with an
 // OpenGL 3.3 core context, audio output and keyboard/gamepad input.
 #if defined(_WIN32) || defined(USE_SDL)
-#ifdef _WIN32
 #include "game.h"
-#include "glad.h"
-#else
-#define GL_GLEXT_PROTOTYPES
-#include <GL/gl.h>
-#include <GL/glext.h>
-#endif
+#include "gl_api.h"
+#include "host_threads.h"
 #include <SDL2/SDL.h>
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +25,7 @@ static SDL_GLContext g_glc = nullptr;
 static SDL_AudioDeviceID g_audio = 0;
 static SDL_GameController* g_pad = nullptr;
 static GLuint g_present_fbo = 0;
+#ifndef USE_GLES2
 // Presentation runs on its own thread with a second (shared) GL context, so waiting for
 // vsync never blocks the emulated CPU (which must keep servicing 3 ms audio interrupts).
 static SDL_GLContext g_present_ctx = nullptr;
@@ -39,6 +35,7 @@ static int g_ready = -1, g_showing = -1;
 static std::mutex g_pm;
 static std::condition_variable g_pcv;
 static void present_thread();
+#endif
 static thread_local bool t_current = false;
 
 // The window lives on its own UI thread, which pumps window messages all the time (Windows
@@ -52,27 +49,46 @@ static bool ui_create() {
         fprintf(stderr, "[sdl] init failed: %s\n", SDL_GetError());
         return false;
     }
+#ifdef USE_GLES2
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,SDL_GL_CONTEXT_PROFILE_ES);
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     int scale = g_cfg.window_scale;
     int ww = (g_cfg.widescreen ? 854 : 640) * scale, wh = 480 * scale;
+#ifdef USE_GLES2
+    SDL_DisplayMode mode;
+    if(SDL_GetDesktopDisplayMode(0,&mode)==0) { ww=mode.w; wh=mode.h; }
+#endif
     Uint32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
     if (g_cfg.fullscreen) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     g_win = SDL_CreateWindow(GAME_NAME " (native)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                              ww, wh, flags);
     if (!g_win) { fprintf(stderr, "[sdl] window failed: %s\n", SDL_GetError()); return false; }
+#ifdef USE_GLES2
+    g_glc=SDL_GL_CreateContext(g_win);
+    if(!g_glc) { fprintf(stderr,"[sdl] ES2 context failed: %s\n",SDL_GetError()); return false; }
+#else
     g_present_ctx = SDL_GL_CreateContext(g_win);              // presenter
     if (!g_present_ctx) { fprintf(stderr, "[sdl] GL context failed: %s\n", SDL_GetError()); return false; }
     SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
     g_glc = SDL_GL_CreateContext(g_win);                      // renderer (shares textures/syncs)
     if (!g_glc) { fprintf(stderr, "[sdl] GL context failed: %s\n", SDL_GetError()); return false; }
+#endif
     SDL_GL_MakeCurrent(g_win, g_glc);
 #ifdef _WIN32
     if (!gl_load(SDL_GL_GetProcAddress)) return false;
 #endif
+#ifdef USE_GLES2
+    SDL_GL_SetSwapInterval(g_cfg.vsync ? 1:0);
+#else
     SDL_GL_SetSwapInterval(0);
+#endif
     fprintf(stderr, "[gl] %s | %s\n", glGetString(GL_RENDERER), glGetString(GL_VERSION));
     SDL_GL_MakeCurrent(g_win, nullptr);                       // free for the emulation threads
     // audio: 32 kHz stereo s16, fed from the AX output
@@ -89,13 +105,16 @@ static bool ui_create() {
 }
 static bool ui_poll();
 static void ui_thread() {
+    host_thread_role(3,"cr-ui");
     if (!ui_create()) { g_ui_state = -1; return; }
+#ifndef USE_GLES2
     std::thread(present_thread).detach();
+#endif
     g_ui_state = 1;
     for (;;) {
-        Uint64 t0 = SDL_GetTicks64();
+        Uint32 t0 = SDL_GetTicks();
         ui_poll();
-        Uint64 dt = SDL_GetTicks64() - t0;
+        Uint32 dt = SDL_GetTicks() - t0;  // unsigned subtraction handles the 49-day wrap
         g_ui_polls++;
         if (dt > 500) fprintf(stderr, "[ui] event pump took %llu ms\n", (unsigned long long)dt);
         SDL_Delay(2);
@@ -207,10 +226,22 @@ static void update_input() {
 
 static std::atomic<bool> g_vsync_dirty{false};
 
+[[noreturn]] static void platform_quit() {
+    config_save();
+    fflush(nullptr);
+#ifdef _WIN32
+    exit(0);
+#else
+    // Detached presentation threads can still wait on static condition variables.
+    // Let the OS reclaim them after saving settings and flushing the log.
+    std::_Exit(0);
+#endif
+}
+
 static void apply_action(int a) {
     if (a == OV_FULLSCREEN) SDL_SetWindowFullscreen(g_win, g_cfg.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
     else if (a == OV_VSYNC) g_vsync_dirty = true;
-    else if (a == OV_QUIT) exit(0);
+    else if (a == OV_QUIT) platform_quit();
 }
 
 // Window/input pump (UI thread only).
@@ -218,7 +249,7 @@ bool gl_platform_poll() { return true; }
 static bool ui_poll() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_QUIT) exit(0);
+        if (e.type == SDL_QUIT) platform_quit();
         if (e.type == SDL_KEYDOWN) {
             SDL_Keycode k = e.key.keysym.sym;
             if (k == SDLK_F1 || k == SDLK_ESCAPE) {
@@ -270,6 +301,25 @@ static bool ui_poll() {
 
 // Called on the emulation thread with the finished frame (top-down texture rows).
 void gl_platform_present(unsigned tex, int w, int h) {
+#ifdef USE_GLES2
+    // The GX worker already runs separately from the guest CPU. Present directly
+    // on its context: no shared-context fences or extra triple-buffer copies.
+    if(!g_present_fbo) glGenFramebuffers(1,&g_present_fbo);
+    GLint draw,read; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING,&draw); glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING,&read);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,g_present_fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,tex,0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,0);
+    glDisable(GL_SCISSOR_TEST); glColorMask(1,1,1,1); glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT);
+    int ww,wh; SDL_GL_GetDrawableSize(g_win,&ww,&wh);
+    int an=g_cfg.widescreen ? 16:4, ad=g_cfg.widescreen ? 9:3;
+    int dw=ww,dh=ww*ad/an; if(dh>wh) {dh=wh;dw=wh*an/ad;}
+    int dx=(ww-dw)/2,dy=(wh-dh)/2;
+    glBlitFramebuffer(0,0,w,h,dx,dy+dh,dx+dw,dy,GL_COLOR_BUFFER_BIT,GL_LINEAR);
+    overlay_draw(ww,wh);
+    SDL_GL_SwapWindow(g_win);
+    if(g_vsync_dirty.exchange(false)) SDL_GL_SetSwapInterval(g_cfg.vsync ? 1:0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,draw); glBindFramebuffer(GL_READ_FRAMEBUFFER,read);
+#else
     if (!g_present_fbo) glGenFramebuffers(1, &g_present_fbo);
     static GLuint dst_fbo = 0;
     if (!dst_fbo) glGenFramebuffers(1, &dst_fbo);
@@ -302,9 +352,11 @@ void gl_platform_present(unsigned tex, int w, int h) {
         g_ready = s;
     }
     g_pcv.notify_one();
+#endif
     gl_platform_poll();
 }
 
+#ifndef USE_GLES2
 // Final scaling of the frame to the window. Downscaling (internal resolution above the
 // window size) averages a grid of bilinear taps across each window pixel's footprint
 // so the extra resolution becomes anti-aliasing instead of shimmer; upscaling is bilinear.
@@ -387,4 +439,5 @@ static void present_thread() {
         { std::lock_guard<std::mutex> g(g_pm); g_showing = -1; }
     }
 }
+#endif
 #endif

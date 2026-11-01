@@ -2,7 +2,9 @@
 #include <cstdint>
 
 struct GXStats {
-    uint64_t fifo_bytes = 0, prims = 0, verts = 0, draw_done = 0, tokens = 0, dl_calls = 0, bad = 0, copies = 0;
+    // The guest CPU writes fifo_bytes; the GX worker writes the other counters.
+    alignas(64) uint64_t fifo_bytes = 0;
+    alignas(64) uint64_t prims = 0, verts = 0, draw_done = 0, tokens = 0, dl_calls = 0, bad = 0, copies = 0;
 };
 struct GXState {
     uint32_t cp[256] = {};

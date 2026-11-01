@@ -3,6 +3,9 @@
 #include <string>
 
 std::string tev_shader_source(const uint32_t* bp);
+#ifdef USE_GLES2
+std::string tev_vertex_shader_source(const uint32_t* bp);
+#endif
 uint64_t tev_shader_key(const uint32_t* bp);
 
 // platform

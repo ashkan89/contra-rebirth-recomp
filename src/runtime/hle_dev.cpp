@@ -2,6 +2,7 @@
 #include "hle.h"
 #include "game.h"
 #include "hostclock.h"
+#include "host_threads.h"
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -27,6 +28,7 @@ void raise_interrupt(Ctx* c, int n) {
 #include "config.h"
 #include "hostinput.h"
 static void vi_thread() {
+    host_thread_role(0,"cr-vi");
     using clk = std::chrono::steady_clock;
     auto next = clk::now();
     static const double env_hz = getenv("VI_HZ") ? atof(getenv("VI_HZ")) : 0;
@@ -80,6 +82,7 @@ uint32_t dec_read() {
     return (uint32_t)(int32_t)(rem * 6075 / 100000);
 }
 static void dec_thread() {
+    host_thread_role(0,"cr-alarm");
     std::unique_lock<std::mutex> lk(dec_mx);
     for (;;) {
         if (!dec_deadline_ns) { dec_cv.wait(lk); continue; }

@@ -7,6 +7,7 @@
 #include "hle.h"
 #include "game.h"
 #include "hostclock.h"
+#include "host_threads.h"
 #include "ax.h"
 #include <thread>
 #include <chrono>
@@ -32,6 +33,7 @@ void hle_AIRegisterDMACallback(Ctx* c) { uint32_t old = g_ai_cb; g_ai_cb = c->r[
 void hle_AIInitDMA(Ctx* c) { g_ai_buf = c->r[3]; g_ai_len = c->r[4]; }
 
 static void ai_thread() {
+    host_thread_role(0,"cr-ai");
     using clk = std::chrono::steady_clock;
     auto next = clk::now();
     const auto period = std::chrono::microseconds(3000);
