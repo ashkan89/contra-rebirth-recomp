@@ -61,6 +61,13 @@ static int16_t fetch(Voice& v, bool& stopped) {
                 v.w[P_ADPCM + 19] = v.w[P_LOOPINFO + 2];
             }
         } else {
+            // Like the real DSP, a one-shot voice also jumps to its loop address when it
+            // reaches the end, then stops. NW4R relies on this: it treats a voice as
+            // finished only when the current address is back at the start of the wave
+            // (AxVoice::IsPlayFinished). Leaving it at the end kept every finished sound
+            // effect alive, the sound player filled up (16 sounds), and the oldest sound
+            // in it -- the background music -- was the one evicted.
+            cur = loop;
             stopped = true;
             v.w[P_RUNNING] = 0;
         }
